@@ -1,0 +1,225 @@
+================================================================
+SQL DCL Homework – Task 4: Theory Questions
+Author : Mari Lortkipanidze
+Database: dvdrental (PostgreSQL)
+================================================================
+
+
+----------------------------------------------------------------
+QUESTION 1
+How can one restrict access to certain columns of a database table?
+----------------------------------------------------------------
+
+ANSWER:
+In PostgreSQL you can restrict column access by granting SELECT (or
+UPDATE / INSERT) only on specific columns rather than the whole table.
+
+Syntax:
+    GRANT SELECT (column1, column2) ON table_name TO role_name;
+
+dvdrental EXAMPLE:
+Suppose a customer-service agent needs to look up customers but must
+NOT see the email address (PII). Grant access only to the safe columns:
+
+    -- Create a restricted role
+    CREATE ROLE agent_readonly;
+    GRANT CONNECT ON DATABASE dvdrental TO agent_readonly;
+    GRANT USAGE   ON SCHEMA public       TO agent_readonly;
+
+    -- Allow SELECT on safe columns only
+    GRANT SELECT (customer_id, first_name, last_name, active)
+          ON TABLE customer
+          TO agent_readonly;
+
+    -- Test: switch role and try to read email
+    SET ROLE agent_readonly;
+    SELECT customer_id, first_name, last_name FROM customer; -- ✅ OK
+    SELECT email FROM customer;  -- ❌ ERROR: permission denied for column "email"
+    RESET ROLE;
+
+REAL-WORLD SCENARIO:
+A call-centre employee searches for customers by name but the company's
+privacy policy forbids them from seeing email addresses or postal codes
+(used only by the marketing team). Column-level grants enforce this
+without requiring a view or application-layer filtering.
+
+Alternative approach – create a VIEW:
+    CREATE VIEW customer_safe AS
+        SELECT customer_id, first_name, last_name, active
+        FROM   customer;
+    GRANT SELECT ON customer_safe TO agent_readonly;
+
+Views are portable but column grants are more granular when you need
+mixed column access on the same underlying table.
+
+
+----------------------------------------------------------------
+QUESTION 2
+What is the difference between user identification
+and user authentication?
+----------------------------------------------------------------
+
+ANSWER:
+
+IDENTIFICATION  = "Who claims to be connecting?"
+                  The user supplies a username (identifier).
+                  PostgreSQL looks it up in pg_roles.
+
+AUTHENTICATION  = "Can they prove they are who they claim?"
+                  PostgreSQL verifies the claim with a secret
+                  (password, certificate, Kerberos ticket, etc.).
+
+In short: identification tells the system WHAT role is requested;
+authentication proves the requester ACTUALLY IS that role.
+
+dvdrental EXAMPLE:
+When a connection arrives:
+    psql -U rentaluser -d dvdrental
+
+1. PostgreSQL IDENTIFIES the role: it searches pg_roles for
+   "rentaluser". If the role does not exist, the connection
+   fails immediately with "role does not exist".
+
+2. PostgreSQL AUTHENTICATES via the method in pg_hba.conf.
+   If the method is "md5", the server challenges the client
+   for a password hash. If it does not match the stored hash
+   in pg_authid, the connection is rejected with
+   "password authentication failed for user rentaluser".
+
+Checking stored credentials (superuser only):
+    SELECT rolname, rolpassword IS NOT NULL AS has_password
+    FROM   pg_authid
+    WHERE  rolcanlogin = TRUE;
+
+REAL-WORLD SCENARIO:
+A video-rental web application sends the username "rentaluser" in its
+connection string (identification). The database then verifies the
+application's password (authentication). Even if an attacker knows
+the username, they cannot connect without the correct credential.
+Separating these two steps is fundamental to access control.
+
+
+----------------------------------------------------------------
+QUESTION 3
+What are the recommended authentication protocols for PostgreSQL?
+----------------------------------------------------------------
+
+ANSWER:
+
+For modern PostgreSQL deployments the recommended methods are:
+
+1. SCRAM-SHA-256 (password-based, strongest built-in method)
+   - Defined in RFC 5802.
+   - Stores a salted, iterated hash — never the plaintext password.
+   - Resistant to replay attacks and rainbow-table attacks.
+   - Supported since PostgreSQL 10; preferred over the legacy md5 method.
+   - Set in pg_hba.conf: host dvdrental rentaluser all scram-sha-256
+   - Force it at the cluster level:
+       ALTER SYSTEM SET password_encryption = 'scram-sha-256';
+
+2. SSL / TLS CLIENT CERTIFICATES (certificate-based)
+   - The client presents an X.509 certificate signed by a trusted CA.
+   - No password transmitted; strongest mutual authentication.
+   - Set in pg_hba.conf: hostssl dvdrental all all cert
+
+3. GSSAPI / KERBEROS (enterprise environments)
+   - Single sign-on integrated with Active Directory / Kerberos KDC.
+   - No password stored in PostgreSQL at all.
+   - Suitable for large organisations with existing identity infrastructure.
+
+4. LDAP / PAM (delegated authentication)
+   - PostgreSQL delegates credential checking to an LDAP server or PAM.
+   - Centralises password management.
+
+NOT RECOMMENDED:
+- "trust"  – no authentication at all; safe only on UNIX socket in
+              isolated single-user dev environments.
+- "md5"    – unsalted hash, vulnerable to rainbow tables, deprecated
+              in PostgreSQL 14+ documentation.
+- "password" – sends plaintext password; never use without SSL.
+
+dvdrental EXAMPLE – harden rentaluser's authentication:
+In pg_hba.conf, replace:
+    host dvdrental rentaluser all md5
+with:
+    hostssl dvdrental rentaluser all scram-sha-256
+
+Then reload: SELECT pg_reload_conf();
+
+REAL-WORLD SCENARIO:
+A dvdrental SaaS platform is PCI-DSS compliant (stores payment card
+data). The security policy mandates encrypted connections and strong
+password hashing. All application accounts use scram-sha-256 over TLS,
+and DBA accounts use certificate-based auth so no password needs to be
+stored in deployment configuration files.
+
+
+----------------------------------------------------------------
+QUESTION 4
+What is proxy authentication in PostgreSQL and what is it for?
+Why does it make role-based access control easier to implement?
+----------------------------------------------------------------
+
+ANSWER:
+
+DEFINITION:
+Proxy authentication (also called "connection pooling with role
+switching") is a pattern in which:
+  a) An application authenticates to PostgreSQL as a single
+     service/pool account (e.g., "app_pool").
+  b) After connecting, the application switches to a specific,
+     limited role for the actual query (SET ROLE client_Mary_Smith).
+
+PostgreSQL supports this with the SET ROLE / SET SESSION
+AUTHORIZATION commands, combined with the GRANT ... TO construct
+that allows one role to assume another.
+
+WHY IT EXISTS:
+Opening a new authenticated connection for each application user is
+expensive (TCP handshake + auth + backend fork). Connection poolers
+(PgBouncer, pgpool-II) maintain a pool of pre-authenticated
+connections. Proxy auth lets those pooled connections "impersonate"
+specific roles per request without re-authenticating.
+
+HOW IT SIMPLIFIES RBAC:
+- Without proxy auth: every user needs a real login account in
+  pg_roles with a password, connection limit, and all privileges
+  granted directly. Managing 10,000 customers as 10,000 login
+  accounts is operationally impossible.
+- With proxy auth: one pool account connects; the app calls
+  SET ROLE client_Mary_Smith for Mary's requests. Mary's RLS
+  policies and privilege grants are applied automatically for the
+  duration of that transaction, then the role is reset.
+
+dvdrental EXAMPLE:
+
+    -- 1. Pool account that can switch to any client role
+    CREATE ROLE app_pool WITH LOGIN PASSWORD 'pool_secret';
+    GRANT CONNECT ON DATABASE dvdrental TO app_pool;
+
+    -- 2. Personalised role for Mary Smith
+    CREATE ROLE client_Mary_Smith;
+    GRANT SELECT ON TABLE rental, payment TO client_Mary_Smith;
+    -- (RLS policies restrict rows to customer_id = 1)
+
+    -- 3. Allow app_pool to assume client_Mary_Smith
+    GRANT client_Mary_Smith TO app_pool;
+
+    -- 4. At runtime, the application does:
+    SET ROLE client_Mary_Smith;
+    SET app.current_customer_id = '1';   -- for RLS
+    SELECT * FROM rental;   -- sees only Mary's rentals ✅
+    RESET ROLE;              -- back to app_pool for next request
+
+REAL-WORLD SCENARIO:
+The dvdrental web portal uses PgBouncer in transaction-pooling mode.
+When a customer logs in, the application middleware calls
+SET ROLE client_{first_name}_{last_name} before executing queries.
+RLS policies automatically filter payment and rental data to that
+customer's rows. When the request ends, RESET ROLE returns the
+connection to the pool. This design means:
+  - Only ONE login account (app_pool) needs managing.
+  - Each customer's data isolation is enforced at the DB layer,
+    not just the application layer.
+  - Adding a new customer requires only CREATE ROLE + GRANT, not
+    a new database password.
