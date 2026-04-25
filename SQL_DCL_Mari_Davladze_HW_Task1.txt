@@ -1,0 +1,242 @@
+================================================================
+SQL DCL Homework – Task 1: Security Audit of dvdrental Database
+Author : Mari Lortkipanidze
+Database: dvdrental (PostgreSQL)
+================================================================
+
+OVERVIEW
+--------
+This document describes the existing security configuration of the
+dvdrental PostgreSQL database, including users/roles, privileges,
+row-level security, and database-level settings. SQL queries and
+their typical outputs are included as evidence.
+
+
+----------------------------------------------------------------
+1. EXISTING USERS / ROLES AND THEIR PERMISSIONS
+----------------------------------------------------------------
+
+QUERY 1 – List all roles and key attributes:
+
+    SELECT rolname,
+           rolsuper,
+           rolcreaterole,
+           rolcreatedb,
+           rolcanlogin,
+           rolconnlimit,
+           rolvaliduntil
+    FROM   pg_roles
+    ORDER  BY rolname;
+
+TYPICAL OUTPUT (condensed):
+    rolname          | rolsuper | rolcreaterole | rolcreatedb | rolcanlogin | rolconnlimit | rolvaliduntil
+    -----------------+----------+---------------+-------------+-------------+--------------+--------------
+    pg_monitor       | false    | false         | false       | false       | -1           |
+    pg_read_all_data | false    | false         | false       | false       | -1           |
+    postgres         | true     | true          | true        | true        | -1           |
+
+ANALYSIS:
+- "postgres" is the default superuser with full privileges (rolsuper = true).
+- System roles like pg_monitor exist but are not granted to any user.
+- No application-specific roles or least-privilege accounts exist out of
+  the box – all work is done as the superuser.
+
+
+QUERY 2 – Show role membership:
+
+    SELECT r.rolname AS role,
+           m.rolname AS member
+    FROM   pg_auth_members am
+    JOIN   pg_roles r ON r.oid = am.roleid
+    JOIN   pg_roles m ON m.oid = am.member
+    ORDER  BY r.rolname;
+
+TYPICAL OUTPUT: (empty — no custom role memberships defined by default)
+
+ANALYSIS:
+No group roles have been defined. All operations run under the
+superuser "postgres", which is a significant risk.
+
+
+----------------------------------------------------------------
+2. TABLE-LEVEL PRIVILEGES
+----------------------------------------------------------------
+
+QUERY 3 – Table grants in the dvdrental schema:
+
+    SELECT grantee,
+           table_name,
+           privilege_type,
+           is_grantable
+    FROM   information_schema.role_table_grants
+    WHERE  table_schema = 'public'
+    ORDER  BY table_name, grantee, privilege_type;
+
+TYPICAL OUTPUT:
+    grantee  | table_name | privilege_type | is_grantable
+    ---------+------------+----------------+-------------
+    postgres | actor      | DELETE         | YES
+    postgres | actor      | INSERT         | YES
+    postgres | actor      | REFERENCES     | YES
+    postgres | actor      | SELECT         | YES
+    postgres | actor      | TRIGGER        | YES
+    postgres | actor      | TRUNCATE       | YES
+    postgres | actor      | UPDATE         | YES
+    (similar rows for all 15 dvdrental tables)
+
+ANALYSIS:
+- Only the superuser "postgres" holds privileges.
+- No restricted, read-only, or role-based grants exist.
+- Any application connecting as "postgres" automatically has DELETE,
+  TRUNCATE, and DROP rights on all data — a critical risk.
+
+
+----------------------------------------------------------------
+3. ROW-LEVEL SECURITY (RLS)
+----------------------------------------------------------------
+
+QUERY 4 – Check RLS status on all tables:
+
+    SELECT relname       AS table_name,
+           relrowsecurity AS rls_enabled,
+           relforcerowsecurity AS rls_forced
+    FROM   pg_class
+    WHERE  relnamespace = (
+               SELECT oid FROM pg_namespace WHERE nspname = 'public'
+           )
+      AND  relkind = 'r'
+    ORDER  BY relname;
+
+TYPICAL OUTPUT:
+    table_name   | rls_enabled | rls_forced
+    -------------+-------------+------------
+    actor        | false       | false
+    address      | false       | false
+    category     | false       | false
+    city         | false       | false
+    country      | false       | false
+    customer     | false       | false
+    film         | false       | false
+    film_actor   | false       | false
+    film_category| false       | false
+    inventory    | false       | false
+    language     | false       | false
+    payment      | false       | false
+    rental       | false       | false
+    staff        | false       | false
+    store        | false       | false
+
+ANALYSIS:
+Row-level security is disabled on every table. Any authenticated user
+with SELECT on a table can see ALL rows — including sensitive customer
+payment data and staff information.
+
+
+----------------------------------------------------------------
+4. DATABASE-LEVEL SETTINGS
+----------------------------------------------------------------
+
+QUERY 5 – Check connection limit and encoding:
+
+    SELECT datname,
+           datconnlimit,
+           pg_encoding_to_char(encoding) AS encoding,
+           datcollate
+    FROM   pg_database
+    WHERE  datname = 'dvdrental';
+
+TYPICAL OUTPUT:
+    datname   | datconnlimit | encoding | datcollate
+    ----------+--------------+----------+------------
+    dvdrental | -1           | UTF8     | en_US.UTF-8
+
+ANALYSIS:
+- datconnlimit = -1 means UNLIMITED connections. Anyone who can
+  authenticate can open as many connections as the server allows.
+- No per-role connection limits are set.
+
+QUERY 6 – Check pg_hba.conf authentication method (view only):
+
+    SELECT type, database, user_name, address, auth_method
+    FROM   pg_hba_file_rules;
+
+TYPICAL OUTPUT (common local dev setup):
+    type  | database | user_name | address   | auth_method
+    ------+----------+-----------+-----------+------------
+    local | all      | all       |           | trust
+    host  | all      | all       | 127.0.0.1 | md5
+    host  | all      | all       | ::1       | md5
+
+ANALYSIS:
+- Local connections use "trust" — no password required for local
+  connections. This is dangerous in any shared or server environment.
+- Remote connections use md5 (weak by modern standards — not salted).
+  Recommended: scram-sha-256.
+
+
+----------------------------------------------------------------
+5. IS THE CURRENT SETUP SUFFICIENT OR RISKY?
+----------------------------------------------------------------
+
+VERDICT: RISKY
+
+Summary of risks:
+  a) Superuser is the only real account. There are no application-level
+     roles with limited privileges. A compromised application would have
+     full access to all data and schema.
+
+  b) No RLS policies exist. Any user with SELECT on "payment" or
+     "customer" can see every customer's payment history and personal
+     data — violating data minimisation principles (and likely GDPR).
+
+  c) Local trust authentication means anyone with OS access to the
+     server can log in without a password.
+
+  d) md5 password hashing is outdated. PostgreSQL has supported the
+     stronger scram-sha-256 method since version 10.
+
+  e) No connection limits. A misconfigured app or attacker can exhaust
+     the connection pool and cause a denial-of-service.
+
+
+----------------------------------------------------------------
+6. IDENTIFIED VULNERABILITY & IMPROVEMENT
+----------------------------------------------------------------
+
+VULNERABILITY: Over-privileged single account (postgres superuser)
+
+An application connecting as "postgres" can:
+  - Read all customer PII and payment data.
+  - Modify or delete any record.
+  - Drop tables or the entire schema.
+  - Create new superusers.
+
+This violates the principle of least privilege and means a single
+SQL injection vulnerability gives an attacker full database control.
+
+RECOMMENDED IMPROVEMENT:
+
+1. Create a dedicated application role with only the required rights:
+
+    CREATE ROLE app_readonly;
+    GRANT CONNECT ON DATABASE dvdrental TO app_readonly;
+    GRANT USAGE   ON SCHEMA public       TO app_readonly;
+    GRANT SELECT  ON ALL TABLES IN SCHEMA public TO app_readonly;
+
+2. For write operations, create a separate, limited write role:
+
+    CREATE ROLE app_write;
+    GRANT INSERT, UPDATE ON TABLE rental, payment TO app_write;
+
+3. Enable RLS on sensitive tables (payment, customer) and attach
+   policies so each user sees only their own rows.
+
+4. Change pg_hba.conf:
+    - Replace "trust" with "scram-sha-256" for local connections.
+    - Replace "md5"   with "scram-sha-256" for host connections.
+
+5. Set a connection limit per role:
+    ALTER ROLE app_readonly CONNECTION LIMIT 20;
+
+These changes reduce the blast radius of any security incident
+and bring the setup in line with the principle of least privilege.
